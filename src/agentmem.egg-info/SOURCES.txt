@@ -1,8 +1,11 @@
+LICENSE
 README.md
 pyproject.toml
 src/agentmem/__init__.py
 src/agentmem/__main__.py
+src/agentmem/batch.py
 src/agentmem/cli.py
+src/agentmem/daemon.py
 src/agentmem/model.py
 src/agentmem/patch.py
 src/agentmem/py.typed
@@ -15,7 +18,11 @@ src/agentmem.egg-info/dependency_links.txt
 src/agentmem.egg-info/entry_points.txt
 src/agentmem.egg-info/requires.txt
 src/agentmem.egg-info/top_level.txt
+tests/test_batch.py
 tests/test_cli_smoke.py
+tests/test_compact.py
+tests/test_daemon_e2e.py
+tests/test_e2e_subprocess.py
 tests/test_patch.py
 tests/test_search.py
 tests/test_session_and_commit.py
