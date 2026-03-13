@@ -5,8 +5,12 @@
 ## TL;DR（給 agent 的最小可行用法）
 
 - **讀 LTM（機器可解析）**：`agentmem recall "<query>" --format json --limit 10`
+- **讀單筆 LTM**：`agentmem show "<id>" --format json`
 - **寫 LTM（較安全，推薦）**：產出 `MemoryPatch(TOML)` → 讓人類/CI 跑 `agentmem patch validate/apply`
 - **寫 LTM（直接寫入）**：`agentmem add ...` / `agentmem update <id> ...` / `agentmem forget <id>`
+- **維護（縮小事件日誌）**：`agentmem compact`（預設會產生 `.bak` 備份）
+- **降低啟動成本**：用 `agentmem batch` 一次執行多個操作（stdin NDJSON → stdout NDJSON）
+- **最佳效能（常駐）**：啟動 `agentmem serve`，由 agent 直接走 TCP NDJSON（避免重複啟動/重複載入）
 - **用 STM session**：`agentmem session start` → 持續 `session add` → 需要時 `session commit --auto`
 
 ### 可直接貼到 Agent 的提示片段（Prompt Snippet）
@@ -19,6 +23,8 @@
 - 讀取記憶：優先用 `agentmem recall "<query>" --format json --limit 10`，只取前 3–7 筆結果用於上下文。
 - 需要除錯排序才用 `--explain`；需要稽核/回放才用 `--as-of`。
 - 寫入長期記憶時，優先產出 MemoryPatch(TOML) 交由人類/CI 審核套用；除非明確允許，否則不要直接寫入。
+- 若你需要在同一回合呼叫多次 `agentmem`，優先使用 `agentmem batch` 合併呼叫以降低重複啟動成本。
+- 若你是長時間常駐的 agent（例如 server / worker），建議用 `agentmem serve` + socket client 直連 daemon。
 - 絕不把密碼、API key、token、私鑰、或敏感個資寫入 LTM。
 - `kind` 請使用：fact/preference/instruction/profile/note/task/other；並加上可檢索的 tags（如 user/project/style/constraint）。
 ```
@@ -62,9 +68,12 @@ STM 用 `session` 管理：每個 session 是一個 NDJSON 事件檔（訊息序
 ```text
 <home>/
   ltm.ndjson
+  daemon.json
   stm/sessions/<session_id>.ndjson
   cache/ltm_state.ndjson
   cache/ltm_state.meta.json
+  cache/ltm_search.ndjson
+  cache/ltm_search.meta.json
 ```
 
 ## 3) Agent I/O 合約（stdout/stderr、JSON 格式、退出碼）
@@ -191,6 +200,91 @@ agentmem update <id> --tags "user,preference,style" --reason "add style tag"
 ```bash
 agentmem forget <id> --reason "outdated"
 ```
+
+顯示單筆（機器可解析）：
+
+```bash
+agentmem show <id> --format json
+```
+
+壓縮事件日誌（保留當前狀態；預設會產生 `.bak` 備份）：
+
+```bash
+agentmem compact --format json
+```
+
+若要把已遺忘/過期條目直接從「新日誌」移除（更小，但會失去 tombstone 狀態）：
+
+```bash
+agentmem compact --drop-inactive
+```
+
+## 7.1) Batch 模式（NDJSON 協定）
+
+用法：stdin 輸入「一行一個 JSON request」，stdout 輸出「一行一個 JSON response」。
+
+### Request 格式（例）
+
+```json
+{"op":"recall","query":"純文本 記憶","limit":5}
+```
+
+### Response 格式（例）
+
+```json
+{"ok":true,"op":"recall","result":[{"score":1.23,"matched_terms":["純","文","本"],"term_counts":{"純":1},"entry":{"id":"...","kind":"note","text":"..."}}]}
+```
+
+### 常見 op
+
+- `init`
+- `add`（`text/kind/tags/importance/source/expires_at/session/id/created_at`）
+- `update`（`id` + `patch`）
+- `forget`（`id`）
+- `show`（`id`）
+- `list`（`limit/include_inactive`）
+- `recall`（`query/limit/kind/tags/include_inactive/as_of`）
+- `compact`（`drop_inactive/backup/dry_run`）
+
+### 範例：合併兩次 recall + 一次 list
+
+```bash
+cat <<'NDJSON' | agentmem batch
+{"op":"recall","query":"偏好 繁體中文","limit":3}
+{"op":"recall","query":"專案 規範","limit":3}
+{"op":"list","limit":5}
+NDJSON
+```
+
+## 7.2) Daemon 模式（常駐服務）
+
+`agentmem serve` 會啟動一個本機 TCP 伺服器，協定同 `batch`（NDJSON），但資料與索引會常駐在記憶體中，適合需要頻繁呼叫的 agent。
+
+### 啟動（前景）
+
+```bash
+agentmem serve
+```
+
+啟動後會：
+
+- stdout 印出一行 JSON（包含 host/port/token）
+- 預設寫入 `<home>/daemon.json`（可用 `--state-file` 覆寫；或 `--no-state-file` 關閉）
+
+### 管理
+
+```bash
+agentmem daemon ping
+agentmem daemon info
+agentmem daemon stop
+```
+
+### 連線協定
+
+- 一行一個 JSON request（必須包含 `token` 與 `op`；token 可從 `daemon.json` 取得）
+- 一行一個 JSON response
+
+> 建議：agent 直接讀 `daemon.json` 後用 socket 直連；避免每次都啟動 `agentmem` 子程序。
 
 ## 8) STM session 建議用法
 

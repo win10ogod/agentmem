@@ -25,6 +25,9 @@ pytest
 
 - `python -m agentmem init/add/recall/list`
 - `python -m agentmem patch validate/apply`
+- `python -m agentmem show/compact/batch`
+
+另外 `tests/test_daemon_e2e.py` 會真的啟動 `agentmem serve`，並用 socket 發送 `ping/add/recall/shutdown`。
 
 ## 4) 手動 Smoke Test（建議）
 
@@ -71,4 +74,3 @@ with TemporaryDirectory() as td:
     print("search_ms", round((t1-t0)*1000, 1))
 PY
 ```
-

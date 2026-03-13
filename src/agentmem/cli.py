@@ -113,6 +113,81 @@ def _build_parser() -> argparse.ArgumentParser:
     fg.add_argument("id")
     fg.add_argument("--reason", default=None)
 
+    show = sub.add_parser("show", help="Show a long-term memory entry by id")
+    show.add_argument("id")
+    show.add_argument("--include-inactive", action="store_true")
+    show.add_argument(
+        "--as-of",
+        default=None,
+        help="Time-travel: ISO datetime (UTC offset required)",
+    )
+    show.add_argument("--format", choices=["text", "json", "md"], default="text")
+
+    compact = sub.add_parser("compact", help="Compact LTM event log into minimal state")
+    compact.add_argument(
+        "--drop-inactive",
+        action="store_true",
+        help="Drop forgotten/expired entries",
+    )
+    compact.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Do not create a backup .bak file",
+    )
+    compact.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute summary without writing changes",
+    )
+    compact.add_argument("--format", choices=["text", "json"], default="text")
+
+    batch = sub.add_parser(
+        "batch",
+        help="Run multiple operations from NDJSON stdin (outputs NDJSON)",
+    )
+    batch.add_argument("--stop-on-error", action="store_true")
+    batch.add_argument("--echo", action="store_true", help="Include request in each response line")
+
+    serve = sub.add_parser("serve", help="Run agentmem daemon (NDJSON over TCP)")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=0)
+    serve.add_argument("--token", default=None, help="Optional auth token; generated if omitted")
+    serve.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help="Daemon state JSON path (default: <home>/daemon.json)",
+    )
+    serve.add_argument(
+        "--no-state-file",
+        action="store_true",
+        help="Do not write daemon state file",
+    )
+
+    daemon = sub.add_parser("daemon", help="Manage agentmem daemon")
+    dsub = daemon.add_subparsers(dest="daemon_cmd", required=True)
+    dping = dsub.add_parser("ping", help="Ping daemon (reads state file)")
+    dping.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help="Daemon state JSON path (default: <home>/daemon.json)",
+    )
+    dstop = dsub.add_parser("stop", help="Stop daemon (reads state file)")
+    dstop.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help="Daemon state JSON path (default: <home>/daemon.json)",
+    )
+    dinfo = dsub.add_parser("info", help="Print daemon state file contents")
+    dinfo.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help="Daemon state JSON path (default: <home>/daemon.json)",
+    )
+
     session = sub.add_parser("session", help="Short-term memory (STM) sessions")
     ssub = session.add_subparsers(dest="session_cmd", required=True)
 
@@ -222,6 +297,51 @@ def _dispatch(ns: argparse.Namespace) -> int:
         case "forget":
             store.forget_ltm(ns.id, reason=ns.reason)
             return 0
+        case "show":
+            as_of = _parse_as_of(ns.as_of)
+            entry = store.get_ltm(ns.id, as_of=as_of, include_inactive=ns.include_inactive)
+            _print_entry(entry, fmt=ns.format)
+            return 0
+        case "compact":
+            result = store.compact_ltm(
+                drop_inactive=ns.drop_inactive,
+                backup=not ns.no_backup,
+                dry_run=ns.dry_run,
+            )
+            if ns.format == "json":
+                print(json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":")))
+            else:
+                backup = result.backup_path if result.backup_path else "-"
+                print(
+                    f"entries {result.entries_total} -> {result.entries_kept}, "
+                    f"events={result.events_written}, backup={backup}"
+                )
+            return 0
+        case "batch":
+            from .batch import run_batch
+
+            return run_batch(
+                store,
+                sys.stdin,
+                sys.stdout,
+                stop_on_error=ns.stop_on_error,
+                echo=ns.echo,
+            )
+        case "serve":
+            from .daemon import default_state_path, serve_forever
+
+            state_path = None
+            if not ns.no_state_file:
+                state_path = ns.state_file or default_state_path(store.paths.home)
+            return serve_forever(
+                store=store,
+                host=ns.host,
+                port=ns.port,
+                token=ns.token,
+                state_path=state_path,
+            )
+        case "daemon":
+            return _dispatch_daemon(store, ns)
         case "session":
             return _dispatch_session(store, ns)
         case "patch":
@@ -291,6 +411,28 @@ def _dispatch_session(store: AgentMemStore, ns: argparse.Namespace) -> int:
             return 0
         case _:
             raise AgentMemError(f"unknown session command: {ns.session_cmd}")
+
+
+def _dispatch_daemon(store: AgentMemStore, ns: argparse.Namespace) -> int:
+    from .daemon import default_state_path, load_state, send_request
+
+    state_path = ns.state_file or default_state_path(store.paths.home)
+    state = load_state(state_path)
+
+    match ns.daemon_cmd:
+        case "info":
+            print(json.dumps(state.to_dict(), ensure_ascii=False, separators=(",", ":")))
+            return 0
+        case "ping":
+            resp = send_request(state, {"op": "ping"})
+            print(json.dumps(resp, ensure_ascii=False, separators=(",", ":")))
+            return 0 if resp.get("ok") is True else 2
+        case "stop":
+            resp = send_request(state, {"op": "shutdown"})
+            print(json.dumps(resp, ensure_ascii=False, separators=(",", ":")))
+            return 0 if resp.get("ok") is True else 2
+        case _:
+            raise AgentMemError(f"unknown daemon command: {ns.daemon_cmd}")
 
 
 def _dispatch_patch(store: AgentMemStore, ns: argparse.Namespace) -> int:
@@ -405,6 +547,28 @@ def _print_entries(entries: list[Any], *, fmt: Literal["text", "json"]) -> None:
         print(f"{e.id}\t{created}\t{status}\t{e.kind}\t{tags}\t{e.importance}\t{e.text}")
 
 
+def _print_entry(entry: Any, *, fmt: Literal["text", "json", "md"]) -> None:
+    if fmt == "json":
+        print(json.dumps(entry.to_dict(), ensure_ascii=False, separators=(",", ":")))
+        return
+
+    tags = ", ".join(entry.tags)
+    created = entry.created_at.isoformat(timespec="seconds")
+    if fmt == "md":
+        meta = f"{entry.kind}, importance={entry.importance}, created_at={created}, tags=[{tags}]"
+        print(f"- **{entry.id}** ({meta})")
+        for line in entry.text.strip().splitlines():
+            print(f"  - {line}")
+        return
+
+    header = (
+        f"[{entry.id}] kind={entry.kind} importance={entry.importance} "
+        f"created_at={created} tags={tags}"
+    )
+    print(header)
+    print(entry.text.rstrip())
+
+
 def _print_hits(hits: list[Any], *, fmt: Literal["text", "json", "md"], explain: bool) -> None:
     if fmt == "json":
         print(
@@ -486,6 +650,11 @@ def _completion_script(shell: Literal["bash", "zsh", "fish"]) -> str:
         "recall",
         "list",
         "forget",
+        "show",
+        "compact",
+        "batch",
+        "serve",
+        "daemon",
         "session",
         "patch",
         "completion",

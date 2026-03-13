@@ -14,12 +14,15 @@
 ```text
 ~/.agentmem/
   ltm.ndjson                 # LTM 事件日誌（append-only）
+  daemon.json                # daemon state（host/port/token；啟用 serve 時）
   stm/
     sessions/
       <session_id>.ndjson    # STM session 事件日誌（append-only）
   cache/
     ltm_state.ndjson         # LTM 衍生快取（可刪除重建）
     ltm_state.meta.json      # 快取指紋（用來判斷是否過期）
+    ltm_search.ndjson        # LTM 搜尋快取（BM25 docstats；可刪除重建）
+    ltm_search.meta.json     # 搜尋快取指紋
 ```
 
 ## 差異化特色（我在主流記憶套件中很少看到「同時」具備）
@@ -98,7 +101,12 @@ agentmem patch apply mem.patch.toml
 
 - `agentmem init`：建立目錄結構（輸出 home 路徑）
 - `agentmem add` / `agentmem update` / `agentmem forget` / `agentmem list`：LTM 基本操作
+- `agentmem show`：用 id 讀取單筆 LTM
 - `agentmem recall`：LTM 搜尋（支援 `--as-of`、`--explain`、`--format json|md`）
+- `agentmem compact`：壓縮 LTM 事件日誌（保留當前狀態）
+- `agentmem batch`：以 NDJSON 一次執行多個操作（降低重複啟動成本）
+- `agentmem serve`：啟動常駐 daemon（NDJSON over TCP）
+- `agentmem daemon ping|stop|info`：管理 daemon（讀取 `daemon.json` state 檔）
 - `agentmem session start|add|show|recall|commit`：STM session 流程（`commit --auto` 離線規則萃取）
 - `agentmem patch template|validate|apply`：MemoryPatch（TOML）審核/套用
 - `agentmem completion bash|zsh|fish`：輸出 shell completion 腳本

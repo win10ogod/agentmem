@@ -207,6 +207,34 @@ class AgentMemStore:
             self._write_ltm_cache(state)
         return self._filter_active(state, include_inactive=include_inactive, at=as_of)
 
+    def get_ltm(
+        self,
+        entry_id: str,
+        *,
+        as_of: datetime | None = None,
+        include_inactive: bool = False,
+    ) -> MemoryEntry:
+        """Get a single LTM entry by id.
+
+        Raises AgentMemError if not found or inactive (unless include_inactive=True).
+        """
+        entry_id = entry_id.strip()
+        if not entry_id:
+            raise AgentMemError("id cannot be empty")
+
+        all_entries = self.load_ltm(as_of=as_of, include_inactive=True)
+        for e in all_entries:
+            if e.id != entry_id:
+                continue
+            if include_inactive:
+                return e
+            at = as_of or datetime.now(UTC)
+            if e.is_active_at(at):
+                return e
+            raise AgentMemError(f"entry is inactive: {entry_id} (use --include-inactive)")
+
+        raise AgentMemError(f"entry not found: {entry_id}")
+
     def _filter_active(
         self,
         entries: list[MemoryEntry],
@@ -333,6 +361,94 @@ class AgentMemStore:
             "events_fingerprint": FileFingerprint.from_path(self.paths.ltm_events).to_json(),
         }
         write_json(self.paths.ltm_state_meta, meta)
+
+    @dataclass(frozen=True, slots=True)
+    class CompactResult:
+        output_path: Path
+        backup_path: Path | None
+        entries_total: int
+        entries_kept: int
+        events_written: int
+        drop_inactive: bool
+        dry_run: bool
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "output_path": str(self.output_path),
+                "backup_path": (str(self.backup_path) if self.backup_path else None),
+                "entries_total": self.entries_total,
+                "entries_kept": self.entries_kept,
+                "events_written": self.events_written,
+                "drop_inactive": self.drop_inactive,
+                "dry_run": self.dry_run,
+            }
+
+    def compact_ltm(
+        self,
+        *,
+        drop_inactive: bool = False,
+        backup: bool = True,
+        dry_run: bool = False,
+    ) -> CompactResult:
+        """Compact the LTM event log into a minimal equivalent log.
+
+        - Keeps current state; rewrites as one `add` per entry
+          + optional `update` + optional `forget`.
+        - If backup=True, moves old `ltm.ndjson` to a timestamped .bak file.
+        - If drop_inactive=True, removes forgotten/expired entries from the new log.
+        """
+        self.init_layout()
+        with FileLock(self.paths.ltm_lock):
+            # Replay full state from events (cache is ok; validated by fingerprint)
+            entries = self.load_ltm(include_inactive=True)
+            total = len(entries)
+            if drop_inactive:
+                now = datetime.now(UTC)
+                entries = [e for e in entries if e.is_active_at(now)]
+            kept = len(entries)
+
+            events = _render_compacted_events(entries)
+            events_written = len(events)
+
+            backup_path: Path | None = None
+            if backup:
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                backup_path = self.paths.home / f"ltm.ndjson.bak-{stamp}"
+                if backup_path.exists():
+                    backup_path = self.paths.home / f"ltm.ndjson.bak-{stamp}-{uuid.uuid4().hex[:8]}"
+
+            if dry_run:
+                return self.CompactResult(
+                    output_path=self.paths.ltm_events,
+                    backup_path=backup_path,
+                    entries_total=total,
+                    entries_kept=kept,
+                    events_written=events_written,
+                    drop_inactive=drop_inactive,
+                    dry_run=True,
+                )
+
+            tmp_path = self.paths.home / f"ltm.ndjson.compact-{uuid.uuid4().hex}.tmp"
+            with tmp_path.open("w", encoding="utf-8", newline="\n") as f:
+                for ev in events:
+                    f.write(json.dumps(ev, ensure_ascii=False, separators=(",", ":")))
+                    f.write("\n")
+
+            if backup and backup_path is not None:
+                self.paths.ltm_events.replace(backup_path)
+
+            tmp_path.replace(self.paths.ltm_events)
+
+        self._invalidate_ltm_caches()
+        return self.CompactResult(
+            output_path=self.paths.ltm_events,
+            backup_path=backup_path,
+            entries_total=total,
+            entries_kept=kept,
+            events_written=events_written,
+            drop_inactive=drop_inactive,
+            dry_run=False,
+        )
 
     def load_ltm_docstats(self, *, include_inactive: bool = False) -> list[DocStats]:
         """Load precomputed LTM doc stats for faster BM25.
@@ -594,3 +710,65 @@ def extract_durable_memories(messages: list[SessionMessage]) -> list[DurableCand
         seen.add(n)
         uniq.append(c)
     return uniq
+
+
+def _render_compacted_events(entries: list[MemoryEntry]) -> list[dict[str, Any]]:
+    """Render a minimal event log that recreates the provided state."""
+    events: list[dict[str, Any]] = []
+
+    def dt(v: datetime | None) -> str | None:
+        if v is None:
+            return None
+        return v.isoformat(timespec="microseconds")
+
+    def dt_seconds(v: datetime | None) -> str | None:
+        if v is None:
+            return None
+        return v.isoformat(timespec="seconds")
+
+    for e in sorted(entries, key=lambda x: x.created_at):
+        events.append(
+            {
+                "op": "add",
+                "ts": dt(e.created_at),
+                "id": e.id,
+                "kind": e.kind,
+                "tags": list(e.tags),
+                "importance": e.importance,
+                "text": e.text,
+                "source": e.source,
+                "expires_at": dt_seconds(e.expires_at),
+                "session": e.session,
+            }
+        )
+
+        if e.updated_at is not None:
+            patch = {
+                "kind": e.kind,
+                "tags": list(e.tags),
+                "importance": e.importance,
+                "text": e.text,
+                "source": e.source,
+                "expires_at": dt_seconds(e.expires_at),
+            }
+            events.append(
+                {
+                    "op": "update",
+                    "ts": dt(e.updated_at),
+                    "id": e.id,
+                    "patch": patch,
+                    "reason": "compact",
+                }
+            )
+
+        if e.forgotten_at is not None:
+            events.append(
+                {
+                    "op": "forget",
+                    "ts": dt(e.forgotten_at),
+                    "id": e.id,
+                    "reason": e.forget_reason,
+                }
+            )
+
+    return events

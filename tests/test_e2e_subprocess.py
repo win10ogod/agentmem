@@ -32,6 +32,10 @@ def test_e2e_subprocess_with_env_home(tmp_path: Path) -> None:
     mid = r.stdout.strip().splitlines()[-1]
     assert mid
 
+    r = _run_agentmem(["show", mid, "--format", "json"], env=env)
+    entry = json.loads(r.stdout)
+    assert entry["id"] == mid
+
     r = _run_agentmem(["recall", "hello", "--format", "json", "--limit", "5"], env=env)
     hits = json.loads(r.stdout)
     assert hits and hits[0]["entry"]["id"] == mid
@@ -60,3 +64,27 @@ text = "from patch"
     entries = json.loads(r.stdout)
     assert any(e["text"] == "from patch" for e in entries)
 
+    r = _run_agentmem(["compact", "--format", "json"], env=env)
+    compact = json.loads(r.stdout)
+    assert compact["backup_path"]
+    assert Path(compact["backup_path"]).exists()
+
+    # Batch mode
+    batch_in = "\n".join(
+        [
+            json.dumps({"op": "recall", "query": "patch", "limit": 5}, ensure_ascii=False),
+            json.dumps({"op": "list", "limit": 5}, ensure_ascii=False),
+            "",
+        ]
+    )
+    r = subprocess.run(
+        [sys.executable, "-m", "agentmem", "batch"],
+        input=batch_in,
+        check=True,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    lines = [json.loads(line) for line in r.stdout.splitlines() if line.strip()]
+    assert lines[0]["ok"] is True and lines[0]["op"] == "recall"
+    assert lines[1]["ok"] is True and lines[1]["op"] == "list"
