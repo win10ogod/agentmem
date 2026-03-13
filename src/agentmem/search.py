@@ -25,12 +25,29 @@ class SearchHit:
     matched_terms: tuple[str, ...]
     term_counts: dict[str, int]
 
+@dataclass(frozen=True, slots=True)
+class DocStats:
+    """Precomputed stats for faster BM25 (avoids per-query tokenization)."""
+
+    entry: MemoryEntry
+    dl: int
+    tf: dict[str, int]
+
 
 def _term_freq(tokens: list[str]) -> dict[str, int]:
     freq: dict[str, int] = {}
     for t in tokens:
         freq[t] = freq.get(t, 0) + 1
     return freq
+
+
+def build_doc_stats(entries: Iterable[MemoryEntry]) -> list[DocStats]:
+    docs: list[DocStats] = []
+    for e in entries:
+        tokens = tokenize(e.text)
+        tf = _term_freq(tokens)
+        docs.append(DocStats(entry=e, dl=len(tokens), tf=tf))
+    return docs
 
 
 def bm25_search(
@@ -92,6 +109,67 @@ def bm25_search(
             hits.append(
                 SearchHit(
                     entry=entry,
+                    score=score,
+                    matched_terms=tuple(matched),
+                    term_counts=term_counts,
+                )
+            )
+
+    hits.sort(key=lambda h: h.score, reverse=True)
+    return hits[: max(0, limit)]
+
+
+def bm25_search_docs(
+    docs: Iterable[DocStats],
+    query: str,
+    *,
+    limit: int = 10,
+    k1: float = 1.2,
+    b: float = 0.75,
+) -> list[SearchHit]:
+    """BM25 ranker over precomputed DocStats (pure lexical, deterministic)."""
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        return []
+
+    docs_list = list(docs)
+    if not docs_list:
+        return []
+
+    avgdl = sum(d.dl for d in docs_list) / len(docs_list)
+    q_terms = set(query_tokens)
+    df: dict[str, int] = {t: 0 for t in q_terms}
+    for d in docs_list:
+        for t in q_terms:
+            if t in d.tf:
+                df[t] += 1
+
+    n = len(docs_list)
+    idf: dict[str, float] = {}
+    for t, dft in df.items():
+        idf[t] = math.log(1.0 + (n - dft + 0.5) / (dft + 0.5))
+
+    hits: list[SearchHit] = []
+    for d in docs_list:
+        dl = d.dl
+        denom_norm = k1 * (1.0 - b + (b * (dl / avgdl if avgdl > 0 else 0.0)))
+
+        score = 0.0
+        term_counts: dict[str, int] = {}
+        matched: list[str] = []
+        for t in query_tokens:
+            f = d.tf.get(t, 0)
+            if f <= 0:
+                continue
+            term_counts[t] = term_counts.get(t, 0) + f
+            if t not in matched:
+                matched.append(t)
+            score += idf.get(t, 0.0) * (f * (k1 + 1.0)) / (f + denom_norm)
+
+        if score > 0:
+            hits.append(
+                SearchHit(
+                    entry=d.entry,
                     score=score,
                     matched_terms=tuple(matched),
                     term_counts=term_counts,

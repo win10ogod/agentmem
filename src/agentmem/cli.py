@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import __version__
-from .search import bm25_search
+from .search import bm25_search, bm25_search_docs
 from .store import AgentMemError, AgentMemStore
 from .utils import default_home, is_tty
 
@@ -185,9 +185,14 @@ def _dispatch(ns: argparse.Namespace) -> int:
             return 0
         case "recall":
             as_of = _parse_as_of(ns.as_of)
-            entries = store.load_ltm(as_of=as_of, include_inactive=ns.include_inactive)
-            entries = _filter_entries(entries, kind=ns.kind, tags=ns.tag)
-            hits = bm25_search(entries, ns.query, limit=ns.limit)
+            if as_of is None:
+                docs = store.load_ltm_docstats(include_inactive=ns.include_inactive)
+                docs = _filter_docs(docs, kind=ns.kind, tags=ns.tag)
+                hits = bm25_search_docs(docs, ns.query, limit=ns.limit)
+            else:
+                entries = store.load_ltm(as_of=as_of, include_inactive=ns.include_inactive)
+                entries = _filter_entries(entries, kind=ns.kind, tags=ns.tag)
+                hits = bm25_search(entries, ns.query, limit=ns.limit)
             _print_hits(hits, fmt=ns.format, explain=ns.explain)
             return 0
         case "update":
@@ -335,6 +340,24 @@ def _messages_as_entries(session: str, msgs: list[Any]) -> list[Any]:
                 forget_reason=None,
             )
         )
+    return out
+
+
+def _filter_docs(docs: list[Any], *, kind: str | None, tags: list[str]) -> list[Any]:
+    k = (kind or "").strip().lower()
+    tset = {t.strip() for t in tags if t.strip()}
+    out = []
+    for d in docs:
+        e = getattr(d, "entry", None)
+        if e is None:
+            continue
+        if k and str(getattr(e, "kind", "")).lower() != k:
+            continue
+        if tset:
+            etags = set(getattr(e, "tags", ()))
+            if not (tset & etags):
+                continue
+        out.append(d)
     return out
 
 

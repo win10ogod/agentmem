@@ -40,6 +40,11 @@ python -m pip install -e ".[dev]"
 
 給「會呼叫 CLI 的 AI agent」的整合手冊：`docs/AGENT_MANUAL.md`
 
+## 測試與優化
+
+- 測試指南：`docs/TESTING.md`
+- 優化清單：`docs/OPTIMIZATION.md`
+
 ## 快速開始
 
 初始化（可選，會建立必要目錄）：

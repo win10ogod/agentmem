@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from .model import MemoryEntry, MemoryKind, SessionMessage
 from .utils import (
@@ -21,6 +21,9 @@ from .utils import (
     utc_now_iso,
     write_json,
 )
+
+if TYPE_CHECKING:
+    from .search import DocStats
 
 
 class AgentMemError(RuntimeError):
@@ -67,6 +70,8 @@ class StorePaths:
     cache_dir: Path
     ltm_state_cache: Path
     ltm_state_meta: Path
+    ltm_search_cache: Path
+    ltm_search_meta: Path
     stm_sessions_dir: Path
 
 
@@ -79,6 +84,8 @@ def resolve_paths(home: Path) -> StorePaths:
         cache_dir=h / "cache",
         ltm_state_cache=h / "cache" / "ltm_state.ndjson",
         ltm_state_meta=h / "cache" / "ltm_state.meta.json",
+        ltm_search_cache=h / "cache" / "ltm_search.ndjson",
+        ltm_search_meta=h / "cache" / "ltm_search.meta.json",
         stm_sessions_dir=h / "stm" / "sessions",
     )
 
@@ -135,7 +142,7 @@ class AgentMemStore:
 
         with FileLock(self.paths.ltm_lock):
             append_jsonl(self.paths.ltm_events, event)
-        self._invalidate_ltm_cache()
+        self._invalidate_ltm_caches()
         return entry_id
 
     def forget_ltm(self, entry_id: str, *, reason: str | None = None) -> None:
@@ -151,7 +158,7 @@ class AgentMemStore:
         }
         with FileLock(self.paths.ltm_lock):
             append_jsonl(self.paths.ltm_events, event)
-        self._invalidate_ltm_cache()
+        self._invalidate_ltm_caches()
 
     def update_ltm(
         self,
@@ -175,7 +182,7 @@ class AgentMemStore:
         }
         with FileLock(self.paths.ltm_lock):
             append_jsonl(self.paths.ltm_events, event)
-        self._invalidate_ltm_cache()
+        self._invalidate_ltm_caches()
 
     def load_ltm(
         self,
@@ -287,9 +294,11 @@ class AgentMemStore:
         # Stable ordering: newest first
         return sorted(entries.values(), key=lambda e: e.created_at, reverse=True)
 
-    def _invalidate_ltm_cache(self) -> None:
+    def _invalidate_ltm_caches(self) -> None:
         with contextlib.suppress(OSError):
             self.paths.ltm_state_meta.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            self.paths.ltm_search_meta.unlink(missing_ok=True)
 
     def _load_ltm_cache(self) -> list[MemoryEntry] | None:
         if not self.paths.ltm_state_cache.exists() or not self.paths.ltm_state_meta.exists():
@@ -324,6 +333,88 @@ class AgentMemStore:
             "events_fingerprint": FileFingerprint.from_path(self.paths.ltm_events).to_json(),
         }
         write_json(self.paths.ltm_state_meta, meta)
+
+    def load_ltm_docstats(self, *, include_inactive: bool = False) -> list[DocStats]:
+        """Load precomputed LTM doc stats for faster BM25.
+
+        This cache is derived data (safe to delete) and is invalidated whenever
+        `ltm.ndjson` changes.
+        """
+        self.init_layout()
+        cached = self._load_ltm_search_cache()
+        if cached is None:
+            # Build from current state (include inactive so we can filter per-call)
+            entries = self.load_ltm(include_inactive=True)
+            from .search import build_doc_stats
+
+            cached = build_doc_stats(entries)
+            self._write_ltm_search_cache(cached)
+
+        if include_inactive:
+            return cached
+
+        now = datetime.now(UTC)
+        return [d for d in cached if d.entry.is_active_at(now)]
+
+    def _load_ltm_search_cache(self) -> list[DocStats] | None:
+        if not self.paths.ltm_search_cache.exists() or not self.paths.ltm_search_meta.exists():
+            return None
+        meta = read_json(self.paths.ltm_search_meta)
+        if meta is None:
+            return None
+        if meta.get("tokenizer") != "v1":
+            return None
+        fp_raw = meta.get("events_fingerprint")
+        if not isinstance(fp_raw, dict):
+            return None
+        try:
+            cached_fp = FileFingerprint.from_json(fp_raw)
+        except Exception:
+            return None
+        if cached_fp != FileFingerprint.from_path(self.paths.ltm_events):
+            return None
+
+        from .search import DocStats
+
+        docs: list[DocStats] = []
+        for obj in read_jsonl(self.paths.ltm_search_cache):
+            entry_raw = obj.get("entry")
+            tf_raw = obj.get("tf")
+            if not isinstance(entry_raw, dict) or not isinstance(tf_raw, dict):
+                continue
+            try:
+                entry = MemoryEntry.from_dict(entry_raw)
+            except Exception:
+                continue
+            try:
+                dl = int(obj.get("dl", 0))
+            except (TypeError, ValueError):
+                dl = 0
+            tf: dict[str, int] = {}
+            for k, v in tf_raw.items():
+                if not isinstance(k, str):
+                    continue
+                try:
+                    tf[k] = int(v)
+                except (TypeError, ValueError):
+                    continue
+            docs.append(DocStats(entry=entry, dl=dl, tf=tf))
+        return docs
+
+    def _write_ltm_search_cache(self, docs: list[DocStats]) -> None:
+        self.paths.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.ltm_search_cache.parent.mkdir(parents=True, exist_ok=True)
+        with self.paths.ltm_search_cache.open("w", encoding="utf-8", newline="\n") as f:
+            for d in docs:
+                obj: dict[str, Any] = {"entry": d.entry.to_dict(), "dl": d.dl, "tf": d.tf}
+                f.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+                f.write("\n")
+        meta: dict[str, Any] = {
+            "created_at": utc_now_iso(),
+            "tokenizer": "v1",
+            "events_fingerprint": FileFingerprint.from_path(self.paths.ltm_events).to_json(),
+        }
+        write_json(self.paths.ltm_search_meta, meta)
 
     # -----------------
     # STM (short-term)
